@@ -7,6 +7,7 @@ const source = readFileSync(new URL("../contracts/VerifiableServiceSettlement.py
 test("validators independently fetch committed evidence", () => {
   assert.match(source, /gl\.nondet\.web\.get\(urls\[index\]\)/);
   assert.match(source, /digest == expected_hashes\[index\]/);
+  assert.match(source, /not _is_sha256\(expected_sha256\)/);
   assert.match(source, /independent = observe\(\)/);
 });
 

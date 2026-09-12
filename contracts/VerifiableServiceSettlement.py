@@ -29,6 +29,12 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _is_sha256(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    return all(character in "0123456789abcdefABCDEF" for character in value)
+
+
 @allow_storage
 @dataclass
 class Job:
@@ -92,7 +98,7 @@ class VerifiableServiceSettlement(gl.Contract):
         job = self.jobs[job_id]
         if gl.message.sender_address != job.provider or job.status not in (ACCEPTED, EVIDENCE_BOUND):
             raise gl.UserError(f"{EXPECTED} provider-only evidence binding")
-        if not url.startswith("https://") or len(expected_sha256) != 64 or job.evidence_count >= 5:
+        if not url.startswith("https://") or not _is_sha256(expected_sha256) or job.evidence_count >= 5:
             raise gl.UserError(f"{EXPECTED} invalid evidence commitment")
         host = _host(url)
         for index in range(int(job.evidence_count)):
