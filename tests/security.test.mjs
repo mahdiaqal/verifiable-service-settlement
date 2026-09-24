@@ -22,3 +22,16 @@ test("settlement transfers locked credits", () => {
   assert.match(source, /job\.status = SETTLED/);
   assert.match(source, /job\.status not in \(ACCEPTED, EVIDENCE_BOUND\)/);
 });
+
+test("locked credits have cancellation and deadline recovery paths", () => {
+  assert.match(source, /def cancel_unaccepted\(self, job_id: str\)/);
+  assert.match(source, /job\.status != OPEN/);
+  assert.match(source, /def refund_expired\(self, job_id: str\)/);
+  assert.match(source, /job\.status not in \(OPEN, ACCEPTED, EVIDENCE_BOUND\) or _now\(\) < job\.deadline/);
+  assert.match(source, /self\._refund\(job_id, job, (CANCELLED|EXPIRED)\)/);
+});
+
+test("provider can initiate predeadline evidence settlement", () => {
+  assert.match(source, /gl\.message\.sender_address not in \(job\.client, job\.provider\)/);
+  assert.match(source, /job\.evidence_count < 2 or _now\(\) >= job\.deadline/);
+});

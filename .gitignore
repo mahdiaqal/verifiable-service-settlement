@@ -1,3 +1,7 @@
 node_modules/
 .env
 *.log
+.test-deps/
+.pytest_cache/
+__pycache__/
+*.pyc

@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from genlayer import *
 
-OPEN, ACCEPTED, EVIDENCE_BOUND, SETTLED, REJECTED, CONFLICTED = (
-    "OPEN", "ACCEPTED", "EVIDENCE_BOUND", "SETTLED", "REJECTED", "CONFLICTED"
+OPEN, ACCEPTED, EVIDENCE_BOUND, SETTLED, REJECTED, CONFLICTED, CANCELLED, EXPIRED = (
+    "OPEN", "ACCEPTED", "EVIDENCE_BOUND", "SETTLED", "REJECTED", "CONFLICTED", "CANCELLED", "EXPIRED"
 )
 EXPECTED = "[EXPECTED]"
 LLM_ERROR = "[LLM_ERROR]"
@@ -61,10 +61,22 @@ class VerifiableServiceSettlement(gl.Contract):
     def __init__(self) -> None:
         self.owner = gl.message.sender_address
 
+    def _refund(self, job_id: str, job: Job, status: str) -> None:
+        packet = {"job_id": job_id, "client": str(job.client), "provider": str(job.provider),
+                  "amount": int(job.amount), "deadline": int(job.deadline), "status": status}
+        root = _sha(json.dumps(packet, sort_keys=True, separators=(",", ":")))
+        self.balances[job.client] = self.balances.get(job.client, 0) + job.amount
+        job.status = status
+        job.proof_root = root
+        job.settled_at = _now()
+        self.jobs[job_id] = job
+        self.reports[job_id] = json.dumps({"proof_root": root, "status": status,
+                                           "reason": "unaccepted" if status == CANCELLED else "deadline"}, sort_keys=True)
+
     @gl.public.write
     def grant_demo_credits(self, account: Address, amount: u256) -> None:
         if gl.message.sender_address != self.owner or amount == 0:
-            raise gl.UserError(f"{EXPECTED} owner-only positive grant")
+            raise gl.vm.UserError(f"{EXPECTED} owner-only positive grant")
         self.balances[account] = self.balances.get(account, 0) + amount
 
     @gl.public.write
@@ -72,11 +84,11 @@ class VerifiableServiceSettlement(gl.Contract):
                    acceptance_criteria: str, amount: u256, deadline: u256) -> None:
         sender = gl.message.sender_address
         if job_id == "" or job_id in self.jobs or provider == sender:
-            raise gl.UserError(f"{EXPECTED} invalid or duplicate job")
+            raise gl.vm.UserError(f"{EXPECTED} invalid or duplicate job")
         if deliverable == "" or acceptance_criteria == "" or amount == 0 or deadline <= _now():
-            raise gl.UserError(f"{EXPECTED} invalid job terms")
+            raise gl.vm.UserError(f"{EXPECTED} invalid job terms")
         if self.balances.get(sender, 0) < amount:
-            raise gl.UserError(f"{EXPECTED} insufficient credits")
+            raise gl.vm.UserError(f"{EXPECTED} insufficient credits")
         self.balances[sender] = self.balances.get(sender, 0) - amount
         self.jobs[job_id] = Job(sender, provider, deliverable, acceptance_criteria,
                                 amount, deadline, 0, OPEN, "", 0)
@@ -84,26 +96,45 @@ class VerifiableServiceSettlement(gl.Contract):
     @gl.public.write
     def accept_job(self, job_id: str) -> None:
         if job_id not in self.jobs:
-            raise gl.UserError(f"{EXPECTED} unknown job")
+            raise gl.vm.UserError(f"{EXPECTED} unknown job")
         job = self.jobs[job_id]
         if gl.message.sender_address != job.provider or job.status != OPEN or _now() >= job.deadline:
-            raise gl.UserError(f"{EXPECTED} job cannot be accepted")
+            raise gl.vm.UserError(f"{EXPECTED} job cannot be accepted")
         job.status = ACCEPTED
         self.jobs[job_id] = job
 
     @gl.public.write
+    def cancel_unaccepted(self, job_id: str) -> None:
+        if job_id not in self.jobs:
+            raise gl.vm.UserError(f"{EXPECTED} unknown job")
+        job = self.jobs[job_id]
+        if gl.message.sender_address != job.client or job.status != OPEN:
+            raise gl.vm.UserError(f"{EXPECTED} only client may cancel an unaccepted job")
+        self._refund(job_id, job, CANCELLED)
+
+    @gl.public.write
+    def refund_expired(self, job_id: str) -> None:
+        if job_id not in self.jobs:
+            raise gl.vm.UserError(f"{EXPECTED} unknown job")
+        job = self.jobs[job_id]
+        if job.status not in (OPEN, ACCEPTED, EVIDENCE_BOUND) or _now() < job.deadline:
+            raise gl.vm.UserError(f"{EXPECTED} job is not expired and unresolved")
+        self._refund(job_id, job, EXPIRED)
+
+    @gl.public.write
     def bind_evidence(self, job_id: str, url: str, expected_sha256: str) -> None:
         if job_id not in self.jobs:
-            raise gl.UserError(f"{EXPECTED} unknown job")
+            raise gl.vm.UserError(f"{EXPECTED} unknown job")
         job = self.jobs[job_id]
-        if gl.message.sender_address != job.provider or job.status not in (ACCEPTED, EVIDENCE_BOUND):
-            raise gl.UserError(f"{EXPECTED} provider-only evidence binding")
+        if (gl.message.sender_address != job.provider or job.status not in (ACCEPTED, EVIDENCE_BOUND)
+                or _now() >= job.deadline):
+            raise gl.vm.UserError(f"{EXPECTED} provider-only evidence binding")
         if not url.startswith("https://") or not _is_sha256(expected_sha256) or job.evidence_count >= 5:
-            raise gl.UserError(f"{EXPECTED} invalid evidence commitment")
+            raise gl.vm.UserError(f"{EXPECTED} invalid evidence commitment")
         host = _host(url)
         for index in range(int(job.evidence_count)):
             if _host(self.evidence_urls[job_id + ":" + str(index)]) == host:
-                raise gl.UserError(f"{EXPECTED} duplicate evidence authority")
+                raise gl.vm.UserError(f"{EXPECTED} duplicate evidence authority")
         key = job_id + ":" + str(job.evidence_count)
         self.evidence_urls[key] = url
         self.evidence_hashes[key] = expected_sha256.lower()
@@ -114,12 +145,12 @@ class VerifiableServiceSettlement(gl.Contract):
     @gl.public.write
     def verify_and_settle(self, job_id: str) -> None:
         if job_id not in self.jobs:
-            raise gl.UserError(f"{EXPECTED} unknown job")
+            raise gl.vm.UserError(f"{EXPECTED} unknown job")
         job = self.jobs[job_id]
-        if gl.message.sender_address != job.client or job.status != EVIDENCE_BOUND:
-            raise gl.UserError(f"{EXPECTED} client-only verification")
-        if job.evidence_count < 2 or _now() > job.deadline:
-            raise gl.UserError(f"{EXPECTED} insufficient or expired evidence")
+        if gl.message.sender_address not in (job.client, job.provider) or job.status != EVIDENCE_BOUND:
+            raise gl.vm.UserError(f"{EXPECTED} party-only verification")
+        if job.evidence_count < 2 or _now() >= job.deadline:
+            raise gl.vm.UserError(f"{EXPECTED} insufficient or expired evidence")
 
         urls = []
         expected_hashes = []
@@ -207,7 +238,7 @@ class VerifiableServiceSettlement(gl.Contract):
     @gl.public.view
     def get_job(self, job_id: str) -> dict:
         if job_id not in self.jobs:
-            raise gl.UserError(f"{EXPECTED} unknown job")
+            raise gl.vm.UserError(f"{EXPECTED} unknown job")
         job = self.jobs[job_id]
         return {"client": job.client, "provider": job.provider, "deliverable": job.deliverable,
                 "acceptance_criteria": job.acceptance_criteria, "amount": job.amount,
@@ -221,5 +252,5 @@ class VerifiableServiceSettlement(gl.Contract):
     @gl.public.view
     def get_report(self, job_id: str) -> str:
         if job_id not in self.reports:
-            raise gl.UserError(f"{EXPECTED} report unavailable")
+            raise gl.vm.UserError(f"{EXPECTED} report unavailable")
         return self.reports[job_id]
